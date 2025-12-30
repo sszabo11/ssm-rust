@@ -1,4 +1,10 @@
-use ndarray::{Array1, Array2};
+use std::{
+    fmt::write,
+    fs::File,
+    io::{BufWriter, Write},
+};
+
+use ndarray::{Array1, Array2, s};
 use rand::Rng;
 
 use crate::embedding::Embedding;
@@ -15,13 +21,21 @@ pub struct SSM {
     gradient_B: Array2<f32>,
 }
 
+fn init_a(d_state: usize) -> Array2<f32> {
+    let mut a = Array2::zeros((d_state, d_state));
+    for i in 0..d_state {
+        a[[i, i]] = -(i as f32 + 1.0).ln(); // or -(0.5 + i as f32)
+    }
+    a
+}
+
 impl SSM {
     pub fn new(d_model: usize, d_state: usize) -> Self {
         let mut rng = rand::rng();
 
         let a = Array2::from_shape_fn((d_state, d_state), |_| rng.random::<f32>() * 0.02 - 0.01);
-        let b = Array2::from_shape_fn((d_state, d_model), |_| rng.random::<f32>() * 0.02 - 0.01);
-        let c = Array2::from_shape_fn((d_model, d_state), |_| rng.random::<f32>() * 0.02 - 0.01);
+        let b = Array2::from_shape_fn((d_state, d_model), |_| rng.random::<f32>() * 0.02 - 0.05);
+        let c = Array2::from_shape_fn((d_model, d_state), |_| rng.random::<f32>() * 0.02 - 0.05);
 
         Self {
             A: a.clone(),
@@ -49,6 +63,7 @@ impl SSM {
     }
 
     pub fn forward_vec(&mut self, input: Array1<f32>) -> Array1<f32> {
+        //println!("Hidden BEFORE: {:?}", &self.hidden.slice(s![..3]));
         //let x = Array1::from_vec(vec![input]);
         // How state changes
         let a_h = self.A.dot(&self.hidden);
@@ -56,10 +71,16 @@ impl SSM {
         // How input influences the state
         let b_x = self.B.dot(&input);
 
+        //println!("A*h: {:?}", &a_h.slice(s![..3]));
+        //println!("B*x: {:?}", &b_x.slice(s![..3]));
         // Update hidden -> Beocomes compressed memory
         self.hidden = a_h + b_x;
 
-        self.C.dot(&self.hidden)
+        //println!("Hidden AFTER: {:?}", &self.hidden.slice(s![..3]));
+
+        let output = self.C.dot(&self.hidden);
+        //println!("Output: {:?}", &output.slice(s![..3]));
+        output
     }
     pub fn forward(&mut self, input: f32) -> f32 {
         let x = Array1::from_vec(vec![input]);
@@ -107,15 +128,13 @@ impl SSM {
         result
     }
 
-    pub fn train_full(&mut self, tr: &Vec<Vec<&'static str>>, lr: f32, model: &mut Embedding) {
-        self.reset_state();
-        self.reset_gradients();
-        let epochs = 1000;
+    pub fn train_full(&mut self, tr: &Vec<Vec<String>>, lr: f32, model: &mut Embedding) {
+        //self.reset_state();
+        //self.reset_gradients();
+        let epochs = 90;
         for epoch in 1..=epochs {
             let mut total_loss: f32 = 0.0;
             for sentence in tr {
-                //let input_words = &sentence[..sentence.len() - 1];
-                //let target_words = &sentence[1..];
                 let input_embs: Vec<Array1<f32>> = sentence[..sentence.len() - 1]
                     .iter()
                     .map(|w| model.encode_word(w))
@@ -129,11 +148,32 @@ impl SSM {
                 total_loss += loss;
             }
 
-            if epoch == epochs {
-                let avg_loss = total_loss / tr.len() as f32;
-                println!("Epoch: {} | Loss: {}", epoch, avg_loss);
+            if total_loss.is_nan() {
+                break;
             }
+
+            //if epoch == epochs {
+            let avg_loss = total_loss / tr.len() as f32;
+            println!("Epoch: {} | Loss: {}", epoch, avg_loss);
+            //}
         }
+    }
+
+    pub fn save_weights(&self, path: &str) -> std::io::Result<()> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+
+        let mut c: Vec<_> = self.gradient_C.iter().collect();
+        let mut b: Vec<_> = self.gradient_B.iter().collect();
+
+        for c in c.iter() {
+            write(&mut c.to_string(), format_args!("")).unwrap();
+        }
+        for b in b.iter() {
+            write(&mut b.to_string(), format_args!("")).unwrap();
+        }
+
+        Ok(())
     }
 
     pub fn train(&mut self, inputs: &[Array1<f32>], targets: &[Array1<f32>], lr: f32) -> f32 {
@@ -147,6 +187,7 @@ impl SSM {
         for input in inputs {
             states.push(self.hidden.clone());
             let output = self.forward_vec(input.clone());
+            //println!("out: {}", output);
 
             outputs.push(output);
         }
@@ -163,10 +204,10 @@ impl SSM {
                 for col in 0..self.C.ncols() {
                     let grad = 2.0 * error[row] * state[col];
                     self.gradient_C[[row, col]] += grad.clamp(-10.0, 10.0);
+                    //self.gradient_C[[row, col]] += grad;
                     //self.gradient_C[[row, col]] += 2.0 * error * state[col]
                 }
             }
-
             //if i < inputs.len() {
             //    let input_val = inputs[i];
             //    for row in 0..self.B.nrows() {
@@ -190,7 +231,6 @@ impl SSM {
         total_loss / n
     }
 
-    pub fn save_weights(path: &str) {}
     pub fn load_weights(path: &str) {}
 
     pub fn reset_state(&mut self) {

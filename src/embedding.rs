@@ -10,7 +10,7 @@ use colored::Colorize;
 use ndarray::{Array, Array1, Array2, ArrayBase, Axis, Dim, Ix1, Ix2, OwnedRepr, ViewRepr};
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::Uniform;
-use rand::random_range;
+use rand::{Rng, random_range};
 use rayon::{
     iter::{
         IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelBridge,
@@ -631,15 +631,76 @@ impl Embedding {
         });
     }
 
+    pub fn decode_word(&self, vec: Array1<f32>, temp: f32) -> String {
+        let input_embedding = self.input_e.lock().unwrap();
+
+        let mut scores = self
+            .vocab
+            .iter()
+            .map(|(w, i)| {
+                let word_vec = input_embedding.row(*i);
+                let dot: f32 = vec.dot(&word_vec);
+                let mag1 = vec.mapv(|x| x * x).sum().sqrt();
+                let mag2 = word_vec.mapv(|x| x * x).sum().sqrt();
+
+                if mag1 == 0.0 || mag2 == 0.0 {
+                    return (0.0, w.to_string());
+                }
+
+                (dot / (mag1 * mag2), w.to_string())
+            })
+            .collect::<Vec<(f32, String)>>();
+
+        let scores_temp: Vec<f32> = scores.iter().map(|(s, _)| (s / temp).exp()).collect();
+
+        let sum: f32 = scores_temp.iter().sum();
+        let probs: Vec<f32> = scores_temp.iter().map(|s| s / sum).collect();
+        println!("sc: {:?} {}", scores_temp, sum);
+
+        let mut rng = rand::rng();
+        let rand_val: f32 = rng.random();
+        let mut cumsum = 0.0;
+
+        println!("PR: {:?}", probs);
+
+        for (i, &prob) in probs.iter().enumerate() {
+            cumsum += prob;
+            if rand_val < cumsum {
+                return scores[i].1.clone();
+            }
+        }
+
+        // Fallback to highest similarity
+        scores.sort_by(|(a, _), (b, _)| b.partial_cmp(a).unwrap());
+        scores[0].1.clone()
+
+        //scores.sort_by(|(v1, s1), (v2, s2)| v1.total_cmp(v2));
+
+        //println!("Sco: {:?} {:?}", scores[0], scores.last().unwrap());
+        //for i in scores.len() - 5..scores.len() {
+        //    println!("{}: {}", scores.len() - i, scores[i].1);
+        //}
+
+        //scores.last().unwrap().1.clone()
+    }
     pub fn encode_word(&self, word: &str) -> Array1<f32> {
         let input_embedding = self.input_e.lock().unwrap();
 
+        let word: String = word.chars().filter(|c| !c.is_ascii_punctuation()).collect();
+
         let i_idx = self
             .w_to_i
-            .get(word)
-            .ok_or(format!("No word found for: {}", word))
-            .unwrap();
-        let encoded_input = input_embedding.row(*i_idx);
+            .get(&word)
+            .ok_or(format!("No word found for: '{}'", word))
+            .unwrap_or(&0);
+
+        let mut encoded_input = input_embedding.row(*i_idx).to_owned();
+
+        // NORMALIZE
+        let magnitude = encoded_input.mapv(|x| x * x).sum().sqrt();
+        if magnitude > 0.0 {
+            encoded_input /= magnitude;
+        }
 
         Array1::from_vec(encoded_input.to_vec())
     }
@@ -815,6 +876,17 @@ impl Embedding {
                 println!("{}", answer.green());
             }
         }
+    }
+    pub fn save_vocab(&self, path: &str) -> std::io::Result<()> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+
+        for (word, i) in self.vocab.iter() {
+            write!(&mut writer, "{}", word)?;
+            writeln!(&mut writer)?;
+        }
+
+        Ok(())
     }
     pub fn save_embeddings_txt(&self, path: &str) -> std::io::Result<()> {
         let file = File::create(path)?;

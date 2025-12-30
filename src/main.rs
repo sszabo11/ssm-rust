@@ -1,14 +1,18 @@
 mod embedding;
+mod embedding2;
 mod ssm;
 mod train;
 mod utils;
 
 use std::collections::HashMap;
+use std::fs;
 
-use crate::train::{train, train_with_optimal};
+use crate::embedding2::EmbeddingChar;
+use crate::train::{prepare_training_data, train, train_with_optimal};
 use crate::{embedding::Embedding, ssm::SSM, train::generate_sequences, utils::corpus_folder};
 use clap::Parser;
 use clap::ValueEnum;
+use ndarray::Array1;
 
 #[derive(ValueEnum, Debug, Clone)] // ArgEnum here
 #[clap(rename_all = "kebab_case")]
@@ -35,8 +39,61 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    // Load/Train embeddings
     let corpus = corpus_folder("./corpus/seuss");
+    let mut embedding = EmbeddingChar::new(corpus, 500, 5, 10);
+
+    match args.train {
+        TrainParam::Embedding => {
+            embedding.train(100, 0.000001, 0.001);
+
+            embedding
+                .save_embeddings_npy("./embeddings/chars-3.npy")
+                .unwrap();
+        }
+        _ => {
+            let matrix = embedding
+                .load_embeddings_npy("./embeddings/chars-3.npy")
+                .unwrap();
+            embedding.set_input(matrix);
+        }
+    }
+
+    let seed = "the cat i";
+    let out1 = embedding.predict2(seed, 30, 2, 0.9);
+    let out6 = embedding.predict2(seed, 30, 2, 0.1);
+    let out2 = embedding.predict2(seed, 30, 2, 0.2);
+    let out = embedding.predict(seed, 30, 8);
+    let out7 = embedding.predict2(seed, 30, 2, 0.6);
+    let out3 = embedding.predict2(seed, 30, 2, 0.4);
+    let out4 = embedding.predict2(seed, 30, 2, 0.3);
+    let out5 = embedding.predict2(seed, 30, 2, 0.5);
+
+    println!("{}", out);
+    println!("{}", out1);
+    println!("{}", out2);
+    println!("{}", out3);
+    println!("{}", out4);
+    println!("{}", out5);
+    println!("{}", out6);
+    println!("{}", out7);
+    let encoded = embedding.encode_word("the cat");
+    let decoded = embedding.decode_word(encoded, 0.1);
+
+    println!("{}", decoded);
+
+    //let out1 = embedding.predict2(seed, 3, 20, 0.7);
+    //let out3 = embedding.predict2(seed, 3, 20, 0.1);
+    //let out4 = embedding.predict2(seed, 3, 20, 0.4);
+    //let out2 = embedding.predict(seed, 3, 20);
+
+    //println!("{}", out1);
+    //println!("{}", out2);
+    //println!("{}", out3);
+    //println!("{}", out4);
+
+    return;
+
+    // Load/Train embeddings
 
     println!("Corpus len: {}", corpus.len());
     println!(
@@ -48,8 +105,10 @@ fn main() {
         "the", "a", "cat", "dog", "bird", "sat", "ran", "flew", "on", "mat", "fast", "likes",
         "fish", "bone", "seed", "is", "black", "brown",
     ];
-    const DIM: usize = 800;
-    let mut model = Embedding::new(vocab_words.join(" "), DIM, 5, 10);
+    const DIM: usize = 500;
+    let mut model = Embedding::new(corpus.clone(), DIM, 4, 10);
+
+    model.save_vocab("./embeddings/vocab.txt").unwrap();
     //println!("{:?}", model.vocab);
 
     //let res = model.predict("The", 400, 4);
@@ -65,79 +124,9 @@ fn main() {
     //tr6.extend(tr10);
     //tr.extend(tr6);
 
-    //let training_sentences = vec![
-    //    // Simple subject-verb-object patterns
-    //    vec!["the", "cat", "sat"],
-    //    vec!["the", "dog", "ran"],
-    //    vec!["the", "bird", "flew"],
-    //    vec!["the", "fish", "swam"],
-    //    // With locations
-    //    vec!["the", "cat", "sat", "on", "mat"],
-    //    vec!["the", "dog", "ran", "in", "park"],
-    //    vec!["the", "bird", "flew", "over", "house"],
-    //    vec!["the", "fish", "swam", "in", "water"],
-    //    // Variations
-    //    vec!["cat", "sat", "on", "mat"],
-    //    vec!["dog", "ran", "in", "park"],
-    //    vec!["bird", "flew", "over", "house"],
-    //    // More patterns
-    //    vec!["the", "cat", "likes", "food"],
-    //    vec!["the", "dog", "likes", "bone"],
-    //    vec!["the", "bird", "likes", "seed"],
-    //    // Longer sequences
-    //    vec!["the", "cat", "sat", "on", "the", "mat"],
-    //    vec!["the", "dog", "ran", "to", "the", "park"],
-    //    vec!["the", "bird", "flew", "to", "the", "tree"],
-    //    // Different starters
-    //    vec!["a", "cat", "sat"],
-    //    vec!["a", "dog", "ran"],
-    //    vec!["a", "bird", "flew"],
-    //    // Actions
-    //    vec!["cat", "eats", "food"],
-    //    vec!["dog", "eats", "bone"],
-    //    vec!["bird", "eats", "seed"],
-    //    // Colors
-    //    vec!["the", "black", "cat", "sat"],
-    //    vec!["the", "brown", "dog", "ran"],
-    //    vec!["the", "blue", "bird", "flew"],
-    //    // Simple descriptions
-    //    vec!["cat", "is", "black"],
-    //    vec!["dog", "is", "brown"],
-    //    vec!["bird", "is", "blue"],
-    //    vec!["sky", "is", "blue"],
-    //    vec!["grass", "is", "green"],
-    //    // More context
-    //    vec!["the", "cat", "sleeps", "on", "bed"],
-    //    vec!["the", "dog", "plays", "in", "yard"],
-    //    vec!["the", "bird", "sings", "in", "tree"],
-    //    // Repetition helps learning
-    //    vec!["the", "cat", "sat"],
-    //    vec!["the", "cat", "sat", "on", "mat"],
-    //    vec!["cat", "sat", "on", "mat"],
-    //    vec!["the", "dog", "ran"],
-    //    vec!["the", "dog", "ran", "fast"],
-    //    vec!["dog", "ran", "fast"],
-    //    // Questions (for variety)
-    //    vec!["where", "is", "cat"],
-    //    vec!["where", "is", "dog"],
-    //    // Possessives
-    //    vec!["my", "cat", "sat"],
-    //    vec!["my", "dog", "ran"],
-    //    vec!["his", "bird", "flew"],
-    //];
+    let training_sentences = prepare_training_data(&corpus);
 
-    let training_sentences = vec![
-        vec!["the", "cat", "sat"],
-        vec!["the", "cat", "sat", "on", "mat"],
-        vec!["the", "dog", "ran"],
-        vec!["the", "dog", "ran", "fast"],
-        vec!["the", "bird", "flew"],
-        vec!["cat", "likes", "fish"],
-        vec!["dog", "likes", "bone"],
-        vec!["bird", "likes", "seed"],
-        vec!["the", "cat", "is", "black"],
-        vec!["the", "dog", "is", "brown"],
-    ];
+    println!("{:?}", training_sentences.iter().take(3));
 
     //let encoded_data = model.encode_data(training_sentences);
     match args.train {
@@ -156,26 +145,36 @@ fn main() {
                 //    .map(|v| v.iter().map(|s| s.to_string()).collect::<Vec<String>>())
                 //    .collect::<Vec<(Vec<String>, Vec<String>)>>();
 
-                ssm.train_full(&training_sentences, 0.0001, &mut model);
+                ssm.train_full(&training_sentences, 0.0009, &mut model);
                 //train(&mut ssm, &tr);
             }
         }
         TrainParam::Embedding => {
-            model.train(5, 0.0012, 0.00001);
+            model.train(5, 0.00001, 0.00001);
             model.save_embeddings_txt("./embeddings/seuss.txt").unwrap();
         }
         TrainParam::Both => {
+            model.train(10, 0.0001, 0.00001);
+            model.save_embeddings_txt("./embeddings/seuss.txt").unwrap();
             if args.find_optimal {
                 //train_with_optimal(&mut ssm, &tr);
             } else {
-                ssm.train_full(&training_sentences, 0.0001, &mut model);
+                ssm.train_full(&training_sentences, 0.0009, &mut model);
+                ssm.save_weights("./weights/weights.txt").unwrap();
             }
         }
     }
-    let out1 = ssm.predict_sequence(&[model.encode_word("the")], 10);
+
+    let start = "the cat";
+    let out1 = ssm.predict_sequence(&[model.encode_word(start)], 30);
+
+    let words = out1
+        .iter()
+        .map(|word_vec| model.decode_word(Array1::from_vec(word_vec.clone()), 1.0))
+        .collect::<Vec<String>>();
+
     println!();
-    println!("Expected: {:?}", &[4.0, 5.0, 6.0, 7.0]);
-    println!("Result: {:?}", out1);
+    println!("Result: {} {}", start, words.join(" "));
     println!();
 
     //let out1 = ssm.predict_sequence(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 10);

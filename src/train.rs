@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use rand::Rng;
+use regex::Regex;
 
 use crate::ssm::SSM;
 
@@ -107,4 +108,33 @@ pub fn train(ssm: &mut SSM, tr: &Vec<(Vec<f32>, Vec<f32>)>) {
             println!("Epoch: {} | Loss: {}", epoch, avg_loss);
         }
     }
+}
+
+pub fn prepare_training_data(corpus: &str) -> Vec<Vec<String>> {
+    let mut sentences = Vec::new();
+
+    // Split by sentence-ending punctuation
+    let re = Regex::new(r"[.!?]+").unwrap();
+
+    for sentence in re.split(corpus) {
+        let sentence = sentence.trim().to_lowercase().clone();
+
+        if sentence.is_empty() {
+            continue;
+        }
+
+        // Split into words
+        let words: Vec<String> = sentence
+            .split_whitespace()
+            .filter(|w| !w.is_empty())
+            .map(|v| v.trim_ascii().to_string())
+            .collect();
+
+        // Only keep sentences with 3+ words
+        if words.len() >= 3 {
+            sentences.push(words);
+        }
+    }
+
+    sentences
 }
