@@ -3,16 +3,19 @@ mod embedding2;
 mod ssm;
 mod train;
 mod utils;
+mod visualize;
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 
 use crate::embedding2::EmbeddingChar;
 use crate::train::{prepare_training_data, train, train_with_optimal};
+use crate::visualize::draw;
 use crate::{embedding::Embedding, ssm::SSM, train::generate_sequences, utils::corpus_folder};
 use clap::Parser;
 use clap::ValueEnum;
-use ndarray::Array1;
+use ndarray::{Array1, Array2, Axis, Slice, s};
 
 #[derive(ValueEnum, Debug, Clone)] // ArgEnum here
 #[clap(rename_all = "kebab_case")]
@@ -40,11 +43,15 @@ fn main() {
     let args = Args::parse();
 
     let corpus = corpus_folder("./corpus/seuss");
-    let mut embedding = EmbeddingChar::new(corpus, 500, 5, 10);
+
+    const DIM: usize = 800;
+    const K: usize = 15;
+    const SL_WIN: usize = 6;
+    let mut embedding = EmbeddingChar::new(corpus.clone(), DIM, SL_WIN, K);
 
     match args.train {
         TrainParam::Embedding => {
-            embedding.train(100, 0.000001, 0.001);
+            embedding.train(200, 0.000002, 0.001);
 
             embedding
                 .save_embeddings_npy("./embeddings/chars-3.npy")
@@ -58,29 +65,54 @@ fn main() {
         }
     }
 
-    let seed = "the cat i";
-    let out1 = embedding.predict2(seed, 30, 2, 0.9);
-    let out6 = embedding.predict2(seed, 30, 2, 0.1);
-    let out2 = embedding.predict2(seed, 30, 2, 0.2);
-    let out = embedding.predict(seed, 30, 8);
-    let out7 = embedding.predict2(seed, 30, 2, 0.6);
-    let out3 = embedding.predict2(seed, 30, 2, 0.4);
-    let out4 = embedding.predict2(seed, 30, 2, 0.3);
-    let out5 = embedding.predict2(seed, 30, 2, 0.5);
+    let seed = "the cat in the ha";
+    //let win = 4;
 
-    println!("{}", out);
-    println!("{}", out1);
-    println!("{}", out2);
-    println!("{}", out3);
-    println!("{}", out4);
-    println!("{}", out5);
-    println!("{}", out6);
-    println!("{}", out7);
-    let encoded = embedding.encode_word("the cat");
-    let decoded = embedding.decode_word(encoded, 0.1);
+    let mut file = File::create("./graphs/out.txt").unwrap();
+    let mut output = String::new();
+    for i in 0..=10 {
+        for win in 0..20 {
+            let i: f32 = i as f32 / 10.0;
+            let out = embedding.predict2(seed, 24, win, i);
+            output.push_str(&format!("Temp: {} | Win: {}\n", i, win));
+            output.push_str(&out);
+            output.push('\n');
+        }
+    }
 
-    println!("{}", decoded);
+    let _ = file.write(output.as_bytes()).unwrap();
+    let out = embedding.predict(seed, 30, 5);
 
+    println!("RES: '{}' ", out);
+
+    let encoded = embedding.encode_word("the cat in the hat saw the ");
+    //println!("e d {:?}", encoded.dim());
+    let decoded = embedding.decode_word2(encoded);
+
+    println!("Response: '{}' ", decoded);
+
+    //let data = embedding.input_e.lock().unwrap();
+    //let chars = embedding.vocab.keys().cloned().collect::<Vec<String>>();
+
+    let word_embedding = EmbeddingChar::new(corpus.clone(), DIM, SL_WIN, K).set_words(&corpus);
+    //word_embedding.from_words(&corpus);
+
+    let w = word_embedding
+        .vocab
+        .keys()
+        .cloned()
+        .collect::<Vec<String>>();
+
+    println!("w: {:?}", w.iter().take(4).collect::<Vec<&String>>());
+
+    let data = word_embedding.input_e.lock().unwrap();
+    println!("d {:?}", data.dim());
+    let data = data.slice_axis(Axis(0), Slice::new(0, Some(100), 1));
+
+    draw(&w, data.to_owned(), "words.png").unwrap();
+    //let w = words.keys().cloned().collect::<Vec<String>>();
+
+    //draw(&w, data.clone(), "1.png").unwrap();
     //let out1 = embedding.predict2(seed, 3, 20, 0.7);
     //let out3 = embedding.predict2(seed, 3, 20, 0.1);
     //let out4 = embedding.predict2(seed, 3, 20, 0.4);
@@ -105,7 +137,6 @@ fn main() {
         "the", "a", "cat", "dog", "bird", "sat", "ran", "flew", "on", "mat", "fast", "likes",
         "fish", "bone", "seed", "is", "black", "brown",
     ];
-    const DIM: usize = 500;
     let mut model = Embedding::new(corpus.clone(), DIM, 4, 10);
 
     model.save_vocab("./embeddings/vocab.txt").unwrap();
