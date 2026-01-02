@@ -45,35 +45,36 @@ fn main() {
     let corpus = corpus_folder("./corpus/seuss");
 
     const DIM: usize = 800;
-    const K: usize = 15;
-    const SL_WIN: usize = 6;
+    const K: usize = 10;
+    const SL_WIN: usize = 4;
     let mut embedding = EmbeddingChar::new(corpus.clone(), DIM, SL_WIN, K);
 
     match args.train {
         TrainParam::Embedding => {
-            embedding.train(200, 0.000002, 0.001);
+            embedding.train(100, 0.000003, 0.001);
 
             embedding
-                .save_embeddings_npy("./embeddings/chars-3.npy")
+                .save_embeddings_npy("./embeddings/chars-4.npy")
                 .unwrap();
         }
         _ => {
             let matrix = embedding
-                .load_embeddings_npy("./embeddings/chars-3.npy")
+                .load_embeddings_npy("./embeddings/chars-4.npy")
                 .unwrap();
             embedding.set_input(matrix);
         }
     }
 
-    let seed = "the cat in the ha";
+    let seed = "One f";
     //let win = 4;
 
     let mut file = File::create("./graphs/out.txt").unwrap();
     let mut output = String::new();
     for i in 0..=10 {
-        for win in 0..20 {
+        for win in 1..20 {
             let i: f32 = i as f32 / 10.0;
-            let out = embedding.predict2(seed, 24, win, i);
+            let out = embedding.predict(seed, 44, win, i);
+            //output.push_str(&format!("Win: {}\n", win));
             output.push_str(&format!("Temp: {} | Win: {}\n", i, win));
             output.push_str(&out);
             output.push('\n');
@@ -81,7 +82,7 @@ fn main() {
     }
 
     let _ = file.write(output.as_bytes()).unwrap();
-    let out = embedding.predict(seed, 30, 5);
+    let out = embedding.predict(seed, 30, 11, 0.2);
 
     println!("RES: '{}' ", out);
 
@@ -94,22 +95,21 @@ fn main() {
     //let data = embedding.input_e.lock().unwrap();
     //let chars = embedding.vocab.keys().cloned().collect::<Vec<String>>();
 
-    let word_embedding = EmbeddingChar::new(corpus.clone(), DIM, SL_WIN, K).set_words(&corpus);
-    //word_embedding.from_words(&corpus);
+    //let word_embedding = EmbeddingChar::new(corpus.clone(), DIM, SL_WIN, K).set_words(&corpus);
 
-    let w = word_embedding
-        .vocab
-        .keys()
-        .cloned()
-        .collect::<Vec<String>>();
+    //let w = word_embedding
+    //    .vocab
+    //    .keys()
+    //    .cloned()
+    //    .collect::<Vec<String>>();
 
-    println!("w: {:?}", w.iter().take(4).collect::<Vec<&String>>());
+    //println!("w: {:?}", w.iter().take(4).collect::<Vec<&String>>());
 
-    let data = word_embedding.input_e.lock().unwrap();
-    println!("d {:?}", data.dim());
-    let data = data.slice_axis(Axis(0), Slice::new(0, Some(100), 1));
+    //let data = word_embedding.input_e.lock().unwrap();
+    //println!("d {:?}", data.dim());
+    //let data = data.slice_axis(Axis(0), Slice::new(0, Some(100), 1));
 
-    draw(&w, data.to_owned(), "words.png").unwrap();
+    //draw(&w, data.to_owned(), "words.png").unwrap();
     //let w = words.keys().cloned().collect::<Vec<String>>();
 
     //draw(&w, data.clone(), "1.png").unwrap();

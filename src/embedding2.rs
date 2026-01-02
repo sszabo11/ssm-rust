@@ -26,7 +26,7 @@ pub fn get_chars(corpus: &str, char_len: usize) -> HashMap<String, usize> {
         if (i + char_len) <= corpus.len() {
             let token: String = (0..char_len).map(|j| chars[i + j]).collect();
 
-            println!("i: {} | token: {}", i, token);
+            //println!("i: {} | token: {}", i, token);
 
             if let Some(occurances) = v.get(&token) {
                 v.insert(token, *occurances + 1);
@@ -108,7 +108,6 @@ impl EmbeddingChar {
         }
     }
     pub fn predict2(&self, query: &str, len: usize, window: usize, temperature: f32) -> String {
-        //println!("Predicting...");
         let input_vector = self.input_e.lock().unwrap();
         let mut prev_tokens = query.to_string();
         let mut response = query.to_string();
@@ -119,7 +118,7 @@ impl EmbeddingChar {
             let query_tokens = {
                 let mut sum = Array1::<f32>::zeros(self.dim);
                 let mut count = 0;
-                for cf in prev_tokens
+                for c in prev_tokens
                     .chars()
                     .collect::<Vec<char>>()
                     .into_iter()
@@ -127,8 +126,8 @@ impl EmbeddingChar {
                     .take(window)
                     .rev()
                 {
-                    let cf_str = cf.to_string();
-                    if let Some(idx) = self.w_to_i.get(&cf_str) {
+                    let c_str = c.to_string();
+                    if let Some(idx) = self.w_to_i.get(&c_str) {
                         sum += &input_vector.row(*idx);
                         count += 1;
                     }
@@ -208,42 +207,103 @@ impl EmbeddingChar {
         response
     }
 
-    pub fn predict(&self, query: &str, len: usize, window: usize) -> String {
+    pub fn predict(&self, query: &str, len: usize, window: usize, temp: f32) -> String {
         let mut prev_tokens = query.to_lowercase().to_string();
         let mut word = String::from(query);
 
-        println!("v le {}", self.vocab.len());
-
-        let vec = self.encode_word(&prev_tokens);
+        //let vec = self.encode_word(&prev_tokens);
         let input_embedding = self.input_e.lock().unwrap();
 
-        let mut vec = vec.row(0);
-
         while word.len() < len {
-            let char = Array1::zeros(self.dim);
-            let mut scores = self
+            let mut last_chars_vec = Array1::zeros(self.dim);
+
+            for i in 0..window {
+                println!("prev: {:?}", prev_tokens);
+                let rev = prev_tokens.chars().rev().collect::<Vec<char>>();
+                let Some(char) = rev.get(i) else {
+                    println!("String too long for window: {}", window);
+                    continue;
+                };
+
+                let char_str = char.to_string();
+
+                let Some(idx) = self.w_to_i.get(&char_str) else {
+                    println!("NO vocab for: '{}' ", char_str);
+                    continue;
+                };
+
+                let vec = input_embedding.row(*idx);
+
+                //println!("vec: {}", vec);
+                last_chars_vec += &vec;
+                last_chars_vec /= ((i / window) - 1) as f32;
+            }
+            let mag = last_chars_vec.mapv(|x| x * x).sum().sqrt();
+            if mag > 0.0 {
+                last_chars_vec /= mag;
+            }
+
+            let scores = self
                 .i_to_w
                 .iter()
                 .map(|(i, w)| {
-                    let word_vec = input_embedding.row(*i);
-                    let dot: f32 = char.dot(&word_vec);
-                    let mag1 = char.mapv(|x| x * x).sum().sqrt();
-                    let mag2 = word_vec.mapv(|x| x * x).sum().sqrt();
+                    let char_vec = input_embedding.row(*i);
+                    let dot: f32 = last_chars_vec.dot(&char_vec);
+                    //let mag1 = last_chars_vec.mapv(|x| x * x).sum().sqrt();
+                    //let mag2 = char_vec.mapv(|x| x * x).sum().sqrt();
 
-                    if mag1 == 0.0 || mag2 == 0.0 {
-                        return (0.0, w.to_string());
-                    }
+                    //if mag1 == 0.0 || mag2 == 0.0 {
+                    //    return (0.0, w.to_string());
+                    //}
 
-                    (dot / (mag1 * mag2), w.to_string())
+                    //let res = dot / (mag1 * mag2);
+                    //println!("M: {} | {} | {}", res, dot, last_chars_vec);
+
+                    (dot, w.to_string())
                 })
                 .collect::<Vec<(f32, String)>>();
 
-            scores.sort_by(|(a, _), (b, _)| b.partial_cmp(a).unwrap());
+            //scores.sort_by(|(a, _), (b, _)| b.partial_cmp(a).unwrap());
 
-            let w = scores[0].1.clone();
+            let max_score = scores
+                .iter()
+                .map(|(s, _)| s)
+                .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
 
+            let exp_scores: Vec<f32> = scores
+                .iter()
+                .map(|(s, _)| ((s - max_score) / temp).exp())
+                .collect();
+
+            let sum: f32 = exp_scores.iter().sum();
+            let probs: Vec<f32> = exp_scores.iter().map(|s| s / sum).collect();
+
+            // Sample from distribution
+            let mut rng = rand::rng();
+            let rand_val: f32 = rng.random();
+            let mut cumsum = 0.0;
+
+            let mut next_char = None;
+            for (i, &prob) in probs.iter().enumerate() {
+                cumsum += prob;
+                if rand_val < cumsum {
+                    next_char = Some(scores[i].1.clone());
+                    break;
+                }
+            }
+
+            if let Some(c) = next_char {
+                word.push_str(&c);
+                prev_tokens.push_str(&c);
+            } else {
+                break;
+            }
+
+            //let w = scores[0].1.clone();
+
+            //prev_tokens.push_str(&w);
             //println!("w {} {}", w, word.len());
-            word.push_str(&w);
+            //word.push_str(&w);
         }
 
         word
