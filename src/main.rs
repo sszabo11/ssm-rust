@@ -1,5 +1,6 @@
 mod embedding;
 mod embedding2;
+mod rnn;
 mod ssm;
 mod train;
 mod utils;
@@ -65,7 +66,7 @@ fn main() {
         }
     }
 
-    let seed = "One f";
+    let seed = "The cat in the h";
     //let win = 4;
 
     let mut file = File::create("./graphs/out.txt").unwrap();
