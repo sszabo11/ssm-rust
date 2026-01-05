@@ -11,7 +11,7 @@ fn main() {
 
     let mut rnn = RNN::new(hidden_size, seq_length, &corpus);
 
-    let y = rnn.step(Array1::zeros(rnn.vocab_size));
-    let y2 = rnn.step(y);
-    let y3 = rnn.step(y2);
+    let y = rnn.forward(Array1::zeros(rnn.vocab_size));
+    let y2 = rnn.forward(y);
+    let y3 = rnn.forward(y2);
 }
