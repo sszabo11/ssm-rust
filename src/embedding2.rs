@@ -72,8 +72,9 @@ pub struct EmbeddingChar {
     corpus: String,
     pub vocab: HashMap<String, usize>,  // With occurances
     pub w_to_i: HashMap<String, usize>, // Word to index
-    i_to_w: HashMap<usize, String>,     // Index to word
+    pub i_to_w: HashMap<usize, String>, // Index to word
     pub dim: usize,
+    pub vector: Vector,
     sliding_window: usize,
     k: usize,
 }
@@ -98,6 +99,7 @@ impl EmbeddingChar {
                 (vocab_size, dim),
                 Uniform::new(-0.1, 0.1).unwrap(),
             ))),
+            vector: Array::zeros((vocab_size, dim)),
             corpus,
             dim,
             vocab: filtered_vocab,

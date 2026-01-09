@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, f64};
 
 use ndarray::{Array, Array1, Array2, ArrayView, ArrayView1, Ix1, Ix2, ShapeArg};
 use ndarray_rand::RandomExt;
 use rand::distr::Uniform;
+
+use crate::embedding2::EmbeddingChar;
 
 pub struct RNN {
     #[allow(non_snake_case)]
@@ -12,44 +14,93 @@ pub struct RNN {
     #[allow(non_snake_case)]
     W_hy: Array2<f32>, // Weight for hidden - output
 
+    #[allow(non_snake_case)]
+    pub W_emb: Array2<f32>, // Weight for embedding
+
     by: Array1<f32>,
     bh: Array1<f32>,
 
     h: Array1<f32>,
     hidden_size: usize,
+    embedding_dim: usize,
     seq_length: usize,
+    //pub embedding: EmbeddingChar,
     pub vocab_size: usize,
 }
 
+pub struct ForwardOutput {
+    pub h_t: Array1<f32>,
+    pub z_t: Array1<f32>,
+    pub a_t: Array1<f32>,
+    pub x_t: Array1<f32>,
+    pub target_y: Array1<f32>,
+    pub pred_y: Array1<f32>,
+}
+
 impl RNN {
-    pub fn new(hidden_size: usize, seq_length: usize, corpus: &str) -> Self {
+    pub fn new(
+        hidden_size: usize,
+        seq_length: usize,
+        corpus: &str,
+        embedding_dim: usize,
+        sliding_window: usize,
+        k: usize,
+    ) -> Self {
         let vocab_size = corpus.len();
 
         Self {
             vocab_size,
             hidden_size,
             seq_length,
+            embedding_dim,
+            //embedding: EmbeddingChar::new(corpus.to_string(), embedding_dim, sliding_window, k),
             h: Array1::zeros(hidden_size),
-            W_hy: Array2::random((vocab_size, hidden_size), Uniform::new(-0.1, 0.1).unwrap()),
-            W_xh: Array2::random((hidden_size, vocab_size), Uniform::new(-0.1, 0.1).unwrap()),
+
+            // Output
+            W_hy: Array2::random(
+                (embedding_dim, hidden_size), // A matrix with embedding dim rows and hidden cols
+                Uniform::new(-0.1, 0.1).unwrap(),
+            ),
+            W_emb: Array2::random(
+                (vocab_size, embedding_dim), // A matrix with embedding dim rows and hidden cols
+                Uniform::new(-0.1, 0.1).unwrap(),
+            ),
+            // Input
+            W_xh: Array2::random(
+                (hidden_size, embedding_dim), // A matrix with hidden rows and embedding dim cols
+                Uniform::new(-0.1, 0.1).unwrap(),
+            ),
             W_hh: Array2::random((hidden_size, hidden_size), Uniform::new(-0.1, 0.1).unwrap()),
             bh: Array1::zeros(hidden_size),
-            by: Array1::zeros(vocab_size),
+            by: Array1::zeros(embedding_dim),
         }
     }
 
-    pub fn forward(&mut self, x: ArrayView1<f32>) -> (Array1<f32>, Array1<f32>, Array1<f32>) {
+    pub fn forward(&mut self, x_idx: usize, y_idx: usize) -> ForwardOutput {
+        let x = self.W_emb.row(x_idx);
+        let target_y_embedding = self.W_emb.row(y_idx);
+
         // Pre-Activation (logits or linear output)
         let z_t = self.W_hh.dot(&self.h) + self.W_xh.dot(&x) + &self.bh;
 
-        // Hidden state
-        let h_t = z_t.tanh();
+        // Hidden state (This is activation a(L))
 
-        self.h = h_t.clone();
-        // Prediction
-        let y = self.W_hy.dot(&self.h) + &self.by;
+        //let a_t = z_t.tanh();
+        let a_t = z_t.map(|z| sigmoid(*z));
 
-        (y, z_t, h_t)
+        self.h = a_t.clone();
+
+        // Prediction / output
+        let pred_y = self.W_hy.dot(&self.h) + &self.by;
+
+        ForwardOutput {
+            h_t: a_t.clone(),
+            z_t,
+            pred_y,
+            a_t,
+            x_t: x.to_owned(),
+            target_y: target_y_embedding.to_owned(),
+        }
     }
 
     // MSE
@@ -72,51 +123,112 @@ impl RNN {
         Array1::zeros(self.hidden_size)
     }
 
-    pub fn train(&mut self, input: Array2<f32>, target: Array2<f32>, batch_size: usize, lr: usize) {
-        for (i, x) in input.rows().into_iter().enumerate() {
-            let target_y = target.row(i);
+    pub fn train(
+        &mut self,
+        input: Array1<usize>, // Sentence of chars as idxs to embedding
+        //target: Array2<f32>,
+        batch_size: usize,
+        lr: f32,
+    ) {
+        // x = idx of char of embedding
+        for (i, x) in input.clone().into_iter().enumerate() {
+            // next idx of char of embedding
+            let target_y = input.get(i + 1).unwrap_or(&0);
+
+            //let target_y_embedding = self.W_emb.row(*target_y);
 
             // Cache the predictions for backprop
-            let mut pred_y_vec = Vec::new();
-            let mut pred_z_vec = Vec::new();
-            let mut total_gradient_W_xh = Array1::<f32>::zeros(self.hidden_size);
-            let mut total_gradient_W_hh = Array1::<f32>::zeros(self.hidden_size);
-            let mut total_gradient_W_hy = Array1::<f32>::zeros(self.vocab_size);
+            let mut pred_y_vec = Vec::new(); // Outputs of previous timesteps
+            let mut pred_z_vec = Vec::new(); // Pre-Activation of previous timesteps
+            let mut pred_h_vec = Vec::new(); // Hidden state of previous timesteps
+            let mut pred_a_vec = Vec::new(); // Activation of previous timesteps
+            let mut pred_x_vec = Vec::new(); // Inputs of previous timesteps
+            let mut pred_real_y_vec = Vec::new(); // Target outputs previous timesteps
+            //let mut pred_L_vec = Vec::new(); // Losses of previous timesteps
 
-            let mut total_gradient_by = Array1::zeros(self.vocab_size);
-            let mut total_gradient_bh = Array1::zeros(self.hidden_size);
+            let mut total_gradient_W_xh = Array2::<f32>::zeros((self.hidden_size, self.vocab_size));
+            let mut total_gradient_W_hh =
+                Array2::<f32>::zeros((self.hidden_size, self.hidden_size));
+            let mut total_gradient_W_hy = Array2::<f32>::zeros((self.vocab_size, self.hidden_size));
+
+            //let mut total_gradient_by = Array1::zeros(self.vocab_size);
+            //let mut total_gradient_bh = Array1::zeros(self.hidden_size);
 
             // Forward
-            for t in 0..self.seq_length {
+            for t in 0..input.len() {
                 self.clear_hidden();
-                let (pred_y, z_t, h_t) = self.forward(x.t());
-                pred_y_vec.push(pred_y);
-                pred_z_vec.push(z_t);
+
+                let f_o = self.forward(x, i + 1);
+
+                //let loss = (&f_o.pred_y - target_y_embedding).pow2();
+                //pred_L_vec.push(loss);
+
+                // Cache for back pass
+                pred_y_vec.push(f_o.pred_y);
+                pred_z_vec.push(f_o.z_t);
+
+                // These are the same!! TODO: FIX
+                pred_h_vec.push(f_o.h_t);
+                pred_a_vec.push(f_o.a_t);
+
+                pred_x_vec.push(f_o.x_t);
+                pred_real_y_vec.push(f_o.target_y);
             }
+            let mut delta_h_next = Array1::zeros(self.hidden_size);
 
             // Backprop
             for t in (0..self.seq_length).rev() {
-                let pred_y = &pred_y_vec[t];
-                let z = &pred_z_vec[t];
+                let y_t = &pred_y_vec[t]; // Predicted Output
+                let z_t = &pred_z_vec[t]; // Pre-Activation
+                let h_t = &pred_h_vec[t]; // Hidden state
+                let h_prev = if t == 0 { h_t } else { &pred_h_vec[t - 1] }; // Hidden t-1 state
+                //let a_t = &pred_a_vec[t]; // Activation state
+                let x_t = &pred_x_vec[t]; // Input state
+                let target_y = &pred_real_y_vec[t]; // Real output state
 
-                let delta_y_t = pred_y - &target_y;
+                let sig_der = z_t.map(|z| sigmoid_der(*z)); // Sigmoid derivative element wise
+                let delta_y = y_t - target_y; // derivative dL/da(L) or dL/dy
+
+                let delta_h = self.W_hy.t().dot(&delta_y) + &delta_h_next;
+                println!("{} {}", delta_y.dim(), sig_der.dim());
+                let delta_z = &delta_h * sig_der; // derivative dL/da(L) or dL/dy
+
+                {
+                    // THIS uses x_t
+                    // For w_xh
+                    let gradient_xh = outer_product(&delta_z, x_t);
+                    total_gradient_W_xh += &gradient_xh;
+                }
+
+                {
+                    // THIS USES h{t-1}
+                    // For w_hh
+                    let gradient_hh = outer_product(&delta_z, h_prev);
+                    total_gradient_W_hh += &gradient_hh;
+                }
+                {
+                    // THIS USES h_t
+                    // For w_hy
+                    let gradient_hy = outer_product(&delta_y, h_t);
+
+                    total_gradient_W_hy += &gradient_hy;
+                    //let total_W_hy = &delta_y * &der_z_wrt_w * &der_a_wrt_z;
+                }
+                delta_h_next = self.W_hh.t().dot(&delta_z);
                 // Propagate error to hidden state
-                let w_hy_T = self.W_hy.to_shape((self.W_hy.nrows(), 1)).unwrap();
+
+                //let w_hy_T = self.W_hy.to_shape((self.W_hy.nrows(), 1)).unwrap();
                 //let delta_h_t = w_hy_T.dot(&delta_y_t) + delta_h_t1;
 
-                let loss = self.loss(target_y.t(), pred_y.t(), batch_size);
-
-                //total_gradient_W_xh += &(&delta_y * self.h[t]);
-
-                //total_gradient_W_hh += &(z * &x);
-                total_gradient_W_hy += &(outer(delta_y_t, self.h));
+                //let loss = self.loss(target_y_embedding.t(), pred_y.t(), batch_size);
             }
-            self.W_xh -= &(lr as f32 * total_gradient_W_xh);
-            self.W_hh -= &(lr as f32 * total_gradient_W_hh);
-            self.W_hy -= &(lr as f32 * total_gradient_W_hy);
 
-            self.bh -= &(lr as f32 * total_gradient_bh);
-            self.by -= &(lr as f32 * total_gradient_by);
+            self.W_xh -= &(lr * total_gradient_W_xh);
+            self.W_hh -= &(lr * total_gradient_W_hh);
+            self.W_hy -= &(lr * total_gradient_W_hy);
+
+            //self.bh -= &(lr * total_gradient_bh);
+            //self.by -= &(lr * total_gradient_by);
         }
     }
 
@@ -134,11 +246,60 @@ impl RNN {
 //    a_t.dot(b_t)
 //}
 
-pub fn outer(x: &Array<f64, Ix1>, y: &Array<f64, Ix1>) -> Array<f64, Ix1> {
+//fn calculate_weight(target_y: Array1<f32>, pred_y: Array1<f32>) -> Array1<f32> {}
+
+pub fn outer_product(x: &Array<f64, Ix1>, y: &Array<f64, Ix1>) -> Array<f64, Ix2> {
     let (size_x, size_y) = (x.shape()[0], y.shape()[0]);
     let x_view = x.view();
     let y_view = y.view();
     let x_reshaped = x_view.to_shape((size_x, 1)).unwrap();
-    let y_reshaped = y_view.to_shape((size_y, 1)).unwrap();
+    let y_reshaped = y_view.to_shape((1, size_y)).unwrap();
     x_reshaped.dot(&y_reshaped)
 }
+
+fn softmax(nums: Vec<f32>) -> Vec<f32> {
+    let sum: f64 = nums.iter().map(|n| f64::consts::E.powf(*n as f64)).sum();
+
+    nums.iter()
+        .map(|n| (f64::consts::E.powf(*n as f64) / sum) as f32)
+        .collect::<Vec<f32>>()
+}
+
+fn sigmoid_der(x: f32) -> f32 {
+    sigmoid(x) * (1.0 - sigmoid(x))
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::array;
+
+    use super::*;
+
+    #[test]
+    fn test_softmax() {
+        let nums = vec![-1.0, 0.0, 3.0, 5.0];
+
+        let soft = softmax(nums);
+
+        assert_eq!(soft.iter().sum::<f32>(), 1.0);
+        assert_eq!(soft[0], 0.00216569646);
+    }
+
+    #[test]
+    fn test_outer() {
+        let a = array![1., 2., 3.];
+        let b = array![4., 5., 6.];
+
+        let outer = &outer_product(&a, &b);
+
+        println!("{}", outer);
+        //assert_eq!(outer, array![32]);
+    }
+}
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+//fn outer_product<'a>(x: &'a Array1<f32>, y: &'a Array1<f32>) -> Array2<f32> {
+//    a.dot(&b.t())
+//}
