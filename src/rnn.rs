@@ -1,9 +1,8 @@
 use std::{collections::HashMap, f64};
 
-use colored::control;
 use ndarray::{Array, Array1, Array2, ArrayView, ArrayView1, Ix1, Ix2, ShapeArg};
 use ndarray_rand::RandomExt;
-use rand::distr::Uniform;
+use rand::distr::{Distribution, Uniform, weighted::WeightedIndex};
 
 use crate::embedding2::{EmbeddingChar, get_chars};
 
@@ -35,21 +34,16 @@ pub struct RNN {
 pub struct ForwardOutput {
     pub h_t: Array1<f32>,
     pub z_t: Array1<f32>,
-    pub a_t: Array1<f32>,
+    //pub a_t: Array1<f32>,
     pub x_t: Array1<f32>,
-    pub target_y: Array1<f32>,
-    pub pred_y: Array1<f32>,
+    //pub target_y: Array1<f32>,
+    //pub pred_y: Array1<f32>,
+    pub target_idx: usize,
+    pub logits_t: Array1<f32>,
 }
 
 impl RNN {
-    pub fn new(
-        hidden_size: usize,
-        seq_length: usize,
-        corpus: &str,
-        embedding_dim: usize,
-        sliding_window: usize,
-        k: usize,
-    ) -> Self {
+    pub fn new(hidden_size: usize, seq_length: usize, corpus: &str, embedding_dim: usize) -> Self {
         let vocab_size = get_chars(corpus, 1).len();
         let mut char_to_i: HashMap<char, usize> = HashMap::new();
         let mut i_to_char: HashMap<usize, char> = HashMap::new();
@@ -70,12 +64,11 @@ impl RNN {
             char_to_i,
             i_to_char,
             embedding_dim,
-            //embedding: EmbeddingChar::new(corpus.to_string(), embedding_dim, sliding_window, k),
             h: Array1::zeros(hidden_size),
 
             // Output
             W_hy: Array2::random(
-                (embedding_dim, hidden_size), // A matrix with embedding dim rows and hidden cols
+                (vocab_size, hidden_size), // A matrix with embedding dim rows and hidden cols
                 Uniform::new(-0.1, 0.1).unwrap(),
             ),
             W_emb: Array2::random(
@@ -89,82 +82,56 @@ impl RNN {
             ),
             W_hh: Array2::random((hidden_size, hidden_size), Uniform::new(-0.1, 0.1).unwrap()),
             bh: Array1::zeros(hidden_size),
-            by: Array1::zeros(embedding_dim),
+            by: Array1::zeros(vocab_size),
         }
     }
 
     pub fn forward(&mut self, input: &Array1<usize>) -> Vec<ForwardOutput> {
+        let seq_len = input.len();
         let mut output: Vec<ForwardOutput> = Vec::with_capacity(input.len());
 
-        for (i, char_idx) in input.iter().enumerate() {
-            if i + 1 >= input.len() {
-                continue;
-            }
+        for t in 0..(seq_len - 1) {
+            println!("{} {}", t, seq_len);
+            let curr_idx = input[t];
+            let next_idx = input[t + 1];
 
-            let x = self.W_emb.row(*char_idx);
-            //println!("x {}", x.dim());
-            //println!("y {}", y_idx);
-            //
-
-            let y_idx = input[i + 1];
-            let target_y_embedding = self.W_emb.row(y_idx);
+            let x = self.W_emb.row(curr_idx);
 
             // Pre-Activation (logits or linear output)
             let z_t = self.W_hh.dot(&self.h) + self.W_xh.dot(&x) + &self.bh;
 
-            // Hidden state (This is activation a(L))
+            let h_t = z_t.mapv(sigmoid);
+            self.h = h_t.clone();
 
-            //let a_t = z_t.tanh();
-            let a_t = z_t.mapv(sigmoid);
-
-            self.h = a_t.clone();
-
-            // Prediction / output
-            let pred_y = self.W_hy.dot(&self.h) + &self.by;
+            // Output logits
+            let logits_t = self.W_hy.dot(&self.h) + &self.by;
 
             output.push(ForwardOutput {
-                h_t: a_t.clone(),
+                h_t: h_t.clone(),
                 z_t,
-                pred_y,
-                a_t,
                 x_t: x.to_owned(),
-                target_y: target_y_embedding.to_owned(),
+                logits_t,
+                target_idx: next_idx,
             });
         }
         output
     }
 
-    // MSE
-    // First part of the chain
-    pub fn loss(
-        &mut self,
-        target_y: ArrayView1<f32>,
-        predicted_y: ArrayView1<f32>,
-        n: usize,
-    ) -> Array1<f32> {
-        // dL/dyt
-        (2.0 * (&target_y - &predicted_y)) / n as f32
-    }
+    // Cross entropy
+    pub fn loss(&mut self, outputs: &[ForwardOutput], input: Array1<usize>) -> f32 {
+        let target_idxs = &input.to_vec()[1..];
 
-    pub fn backward(&mut self, loss: ArrayView1<f32>) -> Array1<f32> {
-        //self.W_xh.map(|w| {
-        //    //let loss = self.loss(target_y, predicted_y, n);
-        //});
-        //
-        Array1::zeros(self.hidden_size)
+        let mut total = 0.0;
+
+        for (out, &target_idx) in outputs.iter().zip(target_idxs) {
+            total += self.cross_entropy_with_logits(&out.logits_t, target_idx)
+        }
+
+        total / outputs.len() as f32
     }
 
     pub fn inference(&mut self, seed: &str, len: usize) -> String {
         let mut response = String::new();
-
-        let last_char = seed.chars().last().unwrap();
-        let idx = self.char_to_i.get(&last_char).expect("Char not found");
-        //let final_logits = &outputs.last().unwrap();
-        //let probs = softmax(final_logits); // now probs sum to 1
-        //let next_char_idx = sample_from_probs(&probs); // e.g., weighted random or argmax
-        //let next_char = idx_to_char[next_char_idx];
-
-        //let mut output: Vec<ForwardOutput> = Vec::with_capacity(input.len());
 
         for char_idx in seed
             .chars()
@@ -176,7 +143,7 @@ impl RNN {
 
             let a_t = z_t.mapv(sigmoid);
 
-            self.h = a_t.clone();
+            self.h = a_t;
         }
 
         while response.len() < len {
@@ -184,8 +151,11 @@ impl RNN {
 
             let probs = softmax(&logits);
 
-            let next_idx = sample(probs);
+            //let next_idx = self.sample_categorical(&probs);
 
+            let next_idx = argmax(&logits);
+
+            //println!("enxt idx: {}", next_idx);
             let char = self.i_to_char.get(&next_idx).unwrap();
             response.push(*char);
 
@@ -200,80 +170,50 @@ impl RNN {
         response
     }
 
-    pub fn cross_entropy(&self, ps: Array1<f32>, targets: Array1<f32>) -> Array1<f32> {
-        ps.log2()
+    pub fn cross_entropy(&self, probs: &Array1<f32>, target_idx: usize) -> f32 {
+        -probs[target_idx].ln().max(-100.0) // clip to avoid log(0) = -inf
+    }
+
+    fn cross_entropy_with_logits(&self, logits: &Array1<f32>, correct_idx: usize) -> f32 {
+        // Numerical stability: subtract max logit
+        let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let log_sum_exp = (logits.mapv(|v| (v - max_logit).exp())).sum().ln() + max_logit;
+        -(logits[correct_idx] - log_sum_exp)
     }
 
     pub fn train(
         &mut self,
         input: Array1<usize>, // Sentence of chars as idxs to embedding
-        //target: Array2<f32>,
         batch_size: usize,
         lr: f32,
-    ) {
-        let mut loss = 0.0;
-        println!("{}", input.len());
-        // x = idx of char of embedding
-        //for (i, x) in input.clone().into_iter().enumerate() {
-        //println!("{}, {}", i, input.len());
-
-        println!("Loss: {}", loss);
-        //println!("i: {} | L: {}", i, input.len());
-        //let target = input[i + 1];
-        // next idx of char of embedding
-        //let target_y = input.get(target).unwrap_or(&0);
-
-        //let target_y_embedding = self.W_emb.row(*target_y);
-
-        // Cache the predictions for backprop
-        //let mut pred_y_vec = Vec::new(); // Outputs of previous timesteps
-        //let mut pred_z_vec = Vec::new(); // Pre-Activation of previous timesteps
-        //let mut pred_h_vec = Vec::new(); // Hidden state of previous timesteps
-        //let mut pred_a_vec = Vec::new(); // Activation of previous timesteps
-        //let mut pred_x_vec = Vec::new(); // Inputs of previous timesteps
-        //let mut pred_real_y_vec = Vec::new(); // Target outputs previous timesteps
-        //let mut pred_L_vec = Vec::new(); // Losses of previous timesteps
-
+    ) -> Option<()> {
         let mut total_gradient_W_xh = Array2::<f32>::zeros((self.hidden_size, self.embedding_dim));
         let mut total_gradient_W_hh = Array2::<f32>::zeros((self.hidden_size, self.hidden_size));
-        let mut total_gradient_W_hy = Array2::<f32>::zeros((self.embedding_dim, self.hidden_size));
+        let mut total_gradient_W_hy = Array2::<f32>::zeros((self.vocab_size, self.hidden_size));
 
         //let mut total_gradient_by = Array1::zeros(self.vocab_size);
         //let mut total_gradient_bh = Array1::zeros(self.hidden_size);
 
-        // Forward
-        //for t in 0..input.len() {
         self.clear_hidden();
 
-        //if i >= input.len() {
-        //    continue 'forward;
-        //}
+        if input.len() == 0 {
+            return None;
+        };
+
         let forward_outputs = self.forward(&input);
 
-        println!("fe {} | {}", forward_outputs.len(), input.len());
-        //assert!(forward_outputs.len() == input.len());
+        let loss = self.loss(&forward_outputs, input);
+        println!("Loss: {}", loss);
 
-        //let l = (f_o.pred_y - target_y_embedding).pow2();
-        //pred_L_vec.push(loss);
-
-        // Cache for back pass
-        //pred_y_vec.push(f_o.map(|f| f.pred_v));
-        //pred_z_vec.push(f_o.z_t);
-
-        //// These are the same!! TODO: FIX
-        //pred_h_vec.push(f_o.h_t);
-        //pred_a_vec.push(f_o.a_t);
-
-        //pred_x_vec.push(f_o.x_t);
-        //pred_real_y_vec.push(f_o.target_y);
-        //}
         let mut delta_h_next = Array1::zeros(self.hidden_size);
 
         // Backprop
         for t in (0..forward_outputs.len()).rev() {
-            let y_t = &forward_outputs[t].pred_y; // Predicted Output
+            //let y_t = &forward_outputs[t].pred_y; // Predicted Output
             let z_t = &forward_outputs[t].z_t; // Pre-Activation
             let h_t = &forward_outputs[t].h_t; // Hidden state
+            let target_idx = &forward_outputs[t].target_idx;
+            let logits_t = &forward_outputs[t].logits_t;
             let h_prev = if t == 0 {
                 h_t
             } else {
@@ -281,12 +221,16 @@ impl RNN {
             }; // Hidden t-1 state
             //let a_t = &pred_a_vec[t]; // Activation state
             let x_t = &forward_outputs[t].x_t; // Input state
-            let target_y = &forward_outputs[t].target_y; // Real output state
+            //let target_y = &forward_outputs[t].target_y; // Real output state
 
             let sig_der = z_t.map(|z| sigmoid_der(*z)); // Sigmoid derivative element wise
-            let delta_y = y_t - target_y; // derivative dL/da(L) or dL/dy
+            //let delta_y = y_t - target_y; // derivative dL/da(L) or dL/dy
 
-            loss = delta_y.sum() / delta_y.len() as f32;
+            //loss = delta_y.sum() / delta_y.len() as f32;
+            let probs = softmax(logits_t);
+            let mut delta_y = probs.clone();
+            *delta_y.get_mut(*target_idx).unwrap() -= 1.0;
+
             let delta_h = self.W_hy.t().dot(&delta_y) + &delta_h_next;
             let delta_z = &delta_h * sig_der; // derivative dL/da(L) or dL/dy
 
@@ -327,23 +271,13 @@ impl RNN {
         //self.bh -= &(lr * total_gradient_bh);
         //self.by -= &(lr * total_gradient_by);
         //}
+        Some(())
     }
 
-    fn clear_hidden(&mut self) {
+    pub fn clear_hidden(&mut self) {
         self.h = Array1::zeros(self.h.dim());
     }
 }
-
-//fn outer<D: ShapeArg>(a: &Array<f32, D>, b: &Array<f32, D>) -> &'static Array<f32, D> {
-//    let (size_a, size_b) = (a.shape()[0], b.shape()[0]);
-//
-//    let a_t = a.clone().to_shape((size_a, 1)).unwrap();
-//    let b_t = b.clone().to_shape((size_b, 1)).unwrap();
-//
-//    a_t.dot(b_t)
-//}
-
-//fn calculate_weight(target_y: Array1<f32>, pred_y: Array1<f32>) -> Array1<f32> {}
 
 pub fn outer_product(x: &Array<f32, Ix1>, y: &Array<f32, Ix1>) -> Array<f32, Ix2> {
     let (size_x, size_y) = (x.shape()[0], y.shape()[0]);
@@ -396,16 +330,24 @@ mod tests {
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
-fn cross_entropy_loss(logits: &Array1<f32>, target_idx: usize) -> f32 {
-    let probs = softmax(logits); // you implement softmax
-    -probs[target_idx].ln() // negative log prob of true class
-}
+//fn cross_entropy_loss(logits: &Array1<f32>, target_idx: usize) -> f32 {
+//    let probs = softmax(logits); // you implement softmax
+//    -probs[target_idx].ln() // negative log prob of true class
+//}
 
 fn sample(probs: Array1<f32>) -> usize {
     println!("probs dim: {}", probs.dim());
     probs.to_vec().sort_by(|a, b| b.total_cmp(a));
 
     2
+}
+
+pub fn argmax(arr: &Array1<f32>) -> usize {
+    arr.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 //fn outer_product<'a>(x: &'a Array1<f32>, y: &'a Array1<f32>) -> Array2<f32> {
