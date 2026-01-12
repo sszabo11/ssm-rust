@@ -18,15 +18,12 @@ use std::{
 pub fn get_chars(corpus: &str, char_len: usize) -> HashMap<String, usize> {
     let mut v: HashMap<String, usize> = HashMap::new();
 
-    println!("len: {}", corpus.len());
     let chars: Vec<char> = corpus.chars().collect();
 
     //for i in (0..corpus.len()).step_by(char_len) {
     for (i, char) in chars.iter().step_by(char_len).enumerate() {
         if (i + char_len) <= corpus.len() {
             let token: String = (0..char_len).map(|j| chars[i + j]).collect();
-
-            //println!("i: {} | token: {}", i, token);
 
             if let Some(occurances) = v.get(&token) {
                 v.insert(token, *occurances + 1);

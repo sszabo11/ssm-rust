@@ -1,21 +1,28 @@
-use std::{collections::HashMap, f64};
+#![allow(non_snake_case)]
 
-use ndarray::{Array, Array1, Array2, ArrayView, ArrayView1, Ix1, Ix2, ShapeArg};
+use std::{
+    collections::HashMap,
+    f64, fs,
+    io::{BufWriter, Read, Write},
+};
+
+use anyhow::Result;
+use ndarray::{
+    Array, Array1, Array2, ArrayView, ArrayView1, Axis, Dimension, Ix1, Ix2, ShapeArg, ShapeBuilder,
+};
 use ndarray_rand::RandomExt;
 use rand::distr::{Distribution, Uniform, weighted::WeightedIndex};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::embedding2::{EmbeddingChar, get_chars};
 
+#[allow(clippy::upper_case_acronyms)]
 pub struct RNN {
-    #[allow(non_snake_case)]
-    W_hh: Array2<f32>, // Weight for hidden - hidden
-    #[allow(non_snake_case)]
-    W_xh: Array2<f32>, // Weight for input - hidden
-    #[allow(non_snake_case)]
-    W_hy: Array2<f32>, // Weight for hidden - output
-
-    #[allow(non_snake_case)]
-    pub W_emb: Array2<f32>, // Weight for embedding
+    W_hh: Array2<f32>,  // Weight for hidden - hidden
+    W_xh: Array2<f32>,  // Weight for input - hidden
+    W_hy: Array2<f32>,  // Weight for hidden - output
+    W_emb: Array2<f32>, // Weight for embedding
 
     by: Array1<f32>,
     bh: Array1<f32>,
@@ -23,8 +30,6 @@ pub struct RNN {
     h: Array1<f32>,
     hidden_size: usize,
     embedding_dim: usize,
-    seq_length: usize,
-    //pub embedding: EmbeddingChar,
     pub vocab_size: usize,
     pub char_to_i: HashMap<char, usize>,
     pub i_to_char: HashMap<usize, char>,
@@ -43,7 +48,7 @@ pub struct ForwardOutput {
 }
 
 impl RNN {
-    pub fn new(hidden_size: usize, seq_length: usize, corpus: &str, embedding_dim: usize) -> Self {
+    pub fn new(hidden_size: usize, corpus: &str, embedding_dim: usize) -> Self {
         let vocab_size = get_chars(corpus, 1).len();
         let mut char_to_i: HashMap<char, usize> = HashMap::new();
         let mut i_to_char: HashMap<usize, char> = HashMap::new();
@@ -60,7 +65,6 @@ impl RNN {
         Self {
             vocab_size,
             hidden_size,
-            seq_length,
             char_to_i,
             i_to_char,
             embedding_dim,
@@ -91,7 +95,6 @@ impl RNN {
         let mut output: Vec<ForwardOutput> = Vec::with_capacity(input.len());
 
         for t in 0..(seq_len - 1) {
-            println!("{} {}", t, seq_len);
             let curr_idx = input[t];
             let next_idx = input[t + 1];
 
@@ -170,10 +173,6 @@ impl RNN {
         response
     }
 
-    pub fn cross_entropy(&self, probs: &Array1<f32>, target_idx: usize) -> f32 {
-        -probs[target_idx].ln().max(-100.0) // clip to avoid log(0) = -inf
-    }
-
     fn cross_entropy_with_logits(&self, logits: &Array1<f32>, correct_idx: usize) -> f32 {
         // Numerical stability: subtract max logit
         let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -181,14 +180,34 @@ impl RNN {
         -(logits[correct_idx] - log_sum_exp)
     }
 
+    pub fn train_corpus(&mut self, corpus: &str, epochs: usize, batch_size: usize, lr: f32) {
+        let mut loss = 0.0;
+        for epoch in 0..epochs {
+            println!("Epoch: {} | Loss: {}", epoch, loss);
+            for sentence in corpus.split_terminator(".") {
+                let tokens: Vec<char> = sentence.chars().collect();
+
+                let idxs: Vec<usize> = tokens
+                    .iter()
+                    .map(|c| self.char_to_i.get(c).copied().expect("Char not found"))
+                    .collect();
+
+                loss = self.train(Array1::from_vec(idxs), batch_size, lr);
+            }
+        }
+    }
+
     pub fn train(
         &mut self,
         input: Array1<usize>, // Sentence of chars as idxs to embedding
         batch_size: usize,
         lr: f32,
-    ) -> Option<()> {
+    ) -> f32 {
+        #[allow(non_snake_case)]
         let mut total_gradient_W_xh = Array2::<f32>::zeros((self.hidden_size, self.embedding_dim));
+        #[allow(non_snake_case)]
         let mut total_gradient_W_hh = Array2::<f32>::zeros((self.hidden_size, self.hidden_size));
+        #[allow(non_snake_case)]
         let mut total_gradient_W_hy = Array2::<f32>::zeros((self.vocab_size, self.hidden_size));
 
         //let mut total_gradient_by = Array1::zeros(self.vocab_size);
@@ -196,14 +215,14 @@ impl RNN {
 
         self.clear_hidden();
 
-        if input.len() == 0 {
-            return None;
+        if input.is_empty() {
+            return 0.0;
         };
 
         let forward_outputs = self.forward(&input);
 
         let loss = self.loss(&forward_outputs, input);
-        println!("Loss: {}", loss);
+        //println!("Loss: {}", loss);
 
         let mut delta_h_next = Array1::zeros(self.hidden_size);
 
@@ -271,12 +290,68 @@ impl RNN {
         //self.bh -= &(lr * total_gradient_bh);
         //self.by -= &(lr * total_gradient_by);
         //}
-        Some(())
+        loss
     }
 
     pub fn clear_hidden(&mut self) {
         self.h = Array1::zeros(self.h.dim());
     }
+
+    pub fn load_weights(&mut self, path: &str) -> Result<()> {
+        let file = fs::File::open(path)?;
+
+        let data: FilePayload = serde_json::from_reader(file).unwrap();
+
+        self.W_emb = vec_2d_to_arr(self.W_emb.shape(), data.W_emb);
+        self.W_xh = vec_2d_to_arr(self.W_xh.shape(), data.W_xh);
+        self.W_hh = vec_2d_to_arr(self.W_hh.shape(), data.W_hh);
+        self.W_hy = vec_2d_to_arr(self.W_hy.shape(), data.W_hy);
+
+        Ok(())
+    }
+    pub fn save_weights(&self, path: &str) -> Result<()> {
+        let file = fs::File::create(path)?;
+
+        let w_hh: Vec<Vec<f32>> = self.W_hh.outer_iter().map(|r| r.to_vec()).collect();
+        let w_xh: Vec<Vec<f32>> = self.W_xh.outer_iter().map(|r| r.to_vec()).collect();
+        let w_hy: Vec<Vec<f32>> = self.W_hy.outer_iter().map(|r| r.to_vec()).collect();
+        let w_emb: Vec<Vec<f32>> = self.W_emb.outer_iter().map(|r| r.to_vec()).collect();
+
+        let data = FilePayload {
+            W_hh: w_hh,
+            W_xh: w_xh,
+            W_hy: w_hy,
+            W_emb: w_emb,
+        };
+
+        let writer = BufWriter::new(file);
+
+        serde_json::to_writer(writer, &data)?;
+
+        Ok(())
+    }
+}
+
+fn vec_2d_to_arr(shape: &[usize], vec: Vec<Vec<f32>>) -> Array2<f32> {
+    let mut arr = Array2::zeros((0, shape[1]));
+
+    vec.into_iter()
+        .for_each(|r| arr.push_row(Array1::from_vec(r).view()).unwrap());
+
+    assert_eq!(arr.shape(), shape);
+    arr
+}
+
+#[derive(Serialize, Deserialize)]
+struct FilePayload {
+    #[allow(non_snake_case)]
+    W_hh: Vec<Vec<f32>>,
+    #[allow(non_snake_case)]
+    W_xh: Vec<Vec<f32>>,
+    #[allow(non_snake_case)]
+    W_hy: Vec<Vec<f32>>,
+    #[allow(non_snake_case)]
+    W_emb: Vec<Vec<f32>>,
 }
 
 pub fn outer_product(x: &Array<f32, Ix1>, y: &Array<f32, Ix1>) -> Array<f32, Ix2> {
@@ -330,13 +405,8 @@ mod tests {
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
-//fn cross_entropy_loss(logits: &Array1<f32>, target_idx: usize) -> f32 {
-//    let probs = softmax(logits); // you implement softmax
-//    -probs[target_idx].ln() // negative log prob of true class
-//}
 
 fn sample(probs: Array1<f32>) -> usize {
-    println!("probs dim: {}", probs.dim());
     probs.to_vec().sort_by(|a, b| b.total_cmp(a));
 
     2
@@ -349,7 +419,3 @@ pub fn argmax(arr: &Array1<f32>) -> usize {
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
-
-//fn outer_product<'a>(x: &'a Array1<f32>, y: &'a Array1<f32>) -> Array2<f32> {
-//    a.dot(&b.t())
-//}
