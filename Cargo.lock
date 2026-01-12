@@ -1399,6 +1399,7 @@ dependencies = [
  "bhtsne",
  "clap",
  "colored",
+ "csv",
  "ndarray",
  "ndarray-npy",
  "ndarray-rand",

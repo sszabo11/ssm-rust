@@ -8,6 +8,7 @@ anyhow = "1.0.100"
 bhtsne = "0.5.4"
 clap = { version = "4.5.53", features = ["derive"] }
 colored = "3.0.0"
+csv = "1.4.0"
 ndarray = "0.17.1"
 ndarray-npy = "0.10.0"
 ndarray-rand = "0.16.0"

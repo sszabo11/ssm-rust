@@ -8,10 +8,15 @@ use std::{
 
 use anyhow::Result;
 use ndarray::{
-    Array, Array1, Array2, ArrayView, ArrayView1, Axis, Dimension, Ix1, Ix2, ShapeArg, ShapeBuilder,
+    Array, Array1, Array2, Array3, ArrayView, ArrayView1, ArrayView2, Axis, Dimension, Ix1, Ix2,
+    ShapeArg, ShapeBuilder,
 };
 use ndarray_rand::RandomExt;
-use rand::distr::{Distribution, Uniform, weighted::WeightedIndex};
+use rand::{
+    distr::{Distribution, Uniform, weighted::WeightedIndex},
+    seq,
+};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -45,6 +50,15 @@ pub struct ForwardOutput {
     //pub pred_y: Array1<f32>,
     pub target_idx: usize,
     pub logits_t: Array1<f32>,
+}
+
+pub struct MiniBatch {
+    total_gradient_W_xh: Array2<f32>,
+    total_gradient_W_hh: Array2<f32>,
+    total_gradient_W_hy: Array2<f32>,
+    total_gradient_by: Array1<f32>,
+    total_gradient_bh: Array1<f32>,
+    loss: f32,
 }
 
 impl RNN {
@@ -90,9 +104,11 @@ impl RNN {
         }
     }
 
-    pub fn forward(&mut self, input: &Array1<usize>) -> Vec<ForwardOutput> {
+    pub fn forward(&self, input: &Array1<usize>) -> Vec<ForwardOutput> {
         let seq_len = input.len();
         let mut output: Vec<ForwardOutput> = Vec::with_capacity(input.len());
+
+        let mut h = Array1::zeros(self.hidden_size);
 
         for t in 0..(seq_len - 1) {
             let curr_idx = input[t];
@@ -101,13 +117,13 @@ impl RNN {
             let x = self.W_emb.row(curr_idx);
 
             // Pre-Activation (logits or linear output)
-            let z_t = self.W_hh.dot(&self.h) + self.W_xh.dot(&x) + &self.bh;
+            let z_t = self.W_hh.dot(&h) + self.W_xh.dot(&x) + &self.bh;
 
             let h_t = z_t.mapv(sigmoid);
-            self.h = h_t.clone();
+            h = h_t.clone();
 
             // Output logits
-            let logits_t = self.W_hy.dot(&self.h) + &self.by;
+            let logits_t = self.W_hy.dot(&h) + &self.by;
 
             output.push(ForwardOutput {
                 h_t: h_t.clone(),
@@ -121,7 +137,7 @@ impl RNN {
     }
 
     // Cross entropy
-    pub fn loss(&mut self, outputs: &[ForwardOutput], input: Array1<usize>) -> f32 {
+    pub fn loss(&self, outputs: &[ForwardOutput], input: Array1<usize>) -> f32 {
         let target_idxs = &input.to_vec()[1..];
 
         let mut total = 0.0;
@@ -133,7 +149,7 @@ impl RNN {
         total / outputs.len() as f32
     }
 
-    pub fn inference(&mut self, seed: &str, len: usize) -> String {
+    pub fn inference(&mut self, seed: &str, len: usize, temp: f32) -> String {
         let mut response = String::new();
 
         for char_idx in seed
@@ -154,11 +170,11 @@ impl RNN {
 
             let probs = softmax(&logits);
 
-            //let next_idx = self.sample_categorical(&probs);
+            //println!("probs: {}", probs);
+            let temp_probs: Array1<f32> = probs.iter().map(|v| v.powi(2) * temp).collect();
 
-            let next_idx = argmax(&logits);
+            let next_idx = sample(temp_probs);
 
-            //println!("enxt idx: {}", next_idx);
             let char = self.i_to_char.get(&next_idx).unwrap();
             response.push(*char);
 
@@ -180,117 +196,220 @@ impl RNN {
         -(logits[correct_idx] - log_sum_exp)
     }
 
-    pub fn train_corpus(&mut self, corpus: &str, epochs: usize, batch_size: usize, lr: f32) {
-        let mut loss = 0.0;
-        for epoch in 0..epochs {
-            println!("Epoch: {} | Loss: {}", epoch, loss);
-            for sentence in corpus.split_terminator(".") {
-                let tokens: Vec<char> = sentence.chars().collect();
+    pub fn train_corpus(
+        &mut self,
+        corpus: &str,
+        epochs: usize,
+        batch_size: usize,
+        lr: f32,
+        seq_len: usize,
+    ) {
+        let chars: Vec<char> = corpus.chars().collect();
 
-                let idxs: Vec<usize> = tokens
-                    .iter()
-                    .map(|c| self.char_to_i.get(c).copied().expect("Char not found"))
-                    .collect();
+        let idxs: Vec<usize> = chars
+            .into_iter()
+            .map(|c| self.char_to_i.get(&c).copied().expect("Char not found"))
+            .collect::<Vec<usize>>();
 
-                loss = self.train(Array1::from_vec(idxs), batch_size, lr);
+        // Collection of sequences. Grouped in seq_len vectors
+        let mut sequences: Vec<Vec<usize>> = idxs.chunks(seq_len).map(|v| v.to_vec()).collect();
+        sequences.pop(); // Last one doesn't have seq length
+
+        // Save as above but in Array
+        let mut batch_input = Array3::zeros((0, batch_size, seq_len));
+
+        let c: Vec<&[Vec<usize>]> = sequences.chunks(batch_size).collect();
+
+        //let cc: Vec<Vec<Vec<usize>>> = c.into_iter().map(|c| c.to_vec()).collect();
+
+        for (i, batch) in c.iter().enumerate() {
+            let mut arr = Array2::zeros((0, seq_len));
+            for s in batch.iter() {
+                arr.push_row(Array1::from_vec(s.to_vec()).view()).unwrap();
             }
+            println!("{:?} | {:?}", arr.dim(), batch_input.dim());
+            if i < c.len() - 1 {
+                batch_input.push(Axis(0), arr.view()).unwrap();
+            }
+        }
+        //println!("batves: {}", batch_input);
+
+        for epoch in 0..epochs {
+            let mut loss = 0.0;
+
+            for batch in batch_input.outer_iter() {
+                let batch_loss = self.train_mini_batch(&batch, lr);
+                loss = batch_loss;
+            }
+
+            //let avg_loss = loss / batch_size as f32;
+            println!("Epoch: {} | Loss: {}", epoch, loss);
         }
     }
 
-    pub fn train(
+    pub fn train_mini_batch(
         &mut self,
-        input: Array1<usize>, // Sentence of chars as idxs to embedding
-        batch_size: usize,
+        inputs: &ArrayView2<usize>, // Single batch
         lr: f32,
     ) -> f32 {
+        let batch_size = inputs.nrows();
+
+        let mut acc_loss = 0.0;
+
+        let mut acc_gradient_W_xh = Array2::<f32>::zeros((self.hidden_size, self.embedding_dim));
         #[allow(non_snake_case)]
-        let mut total_gradient_W_xh = Array2::<f32>::zeros((self.hidden_size, self.embedding_dim));
+        let mut acc_gradient_W_hh = Array2::<f32>::zeros((self.hidden_size, self.hidden_size));
         #[allow(non_snake_case)]
-        let mut total_gradient_W_hh = Array2::<f32>::zeros((self.hidden_size, self.hidden_size));
-        #[allow(non_snake_case)]
-        let mut total_gradient_W_hy = Array2::<f32>::zeros((self.vocab_size, self.hidden_size));
+        let mut acc_gradient_W_hy = Array2::<f32>::zeros((self.vocab_size, self.hidden_size));
 
-        //let mut total_gradient_by = Array1::zeros(self.vocab_size);
-        //let mut total_gradient_bh = Array1::zeros(self.hidden_size);
+        let mut acc_gradient_by = Array1::zeros(self.vocab_size);
+        let mut acc_gradient_bh = Array1::zeros(self.hidden_size);
 
-        self.clear_hidden();
+        // Each sequence in batch
+        let values: Vec<MiniBatch> = (0..batch_size)
+            .collect::<Vec<usize>>()
+            .par_iter()
+            .map(|batch| {
+                let input = inputs.row(*batch).to_owned();
 
-        if input.is_empty() {
-            return 0.0;
-        };
+                #[allow(non_snake_case)]
+                let mut total_gradient_W_xh =
+                    Array2::<f32>::zeros((self.hidden_size, self.embedding_dim));
+                #[allow(non_snake_case)]
+                let mut total_gradient_W_hh =
+                    Array2::<f32>::zeros((self.hidden_size, self.hidden_size));
+                #[allow(non_snake_case)]
+                let mut total_gradient_W_hy =
+                    Array2::<f32>::zeros((self.vocab_size, self.hidden_size));
 
-        let forward_outputs = self.forward(&input);
+                let mut total_gradient_by = Array1::zeros(self.vocab_size);
+                let mut total_gradient_bh = Array1::zeros(self.hidden_size);
 
-        let loss = self.loss(&forward_outputs, input);
-        //println!("Loss: {}", loss);
+                //self.clear_hidden();
 
-        let mut delta_h_next = Array1::zeros(self.hidden_size);
+                if input.is_empty() {
+                    println!("em,pty");
+                };
 
-        // Backprop
-        for t in (0..forward_outputs.len()).rev() {
-            //let y_t = &forward_outputs[t].pred_y; // Predicted Output
-            let z_t = &forward_outputs[t].z_t; // Pre-Activation
-            let h_t = &forward_outputs[t].h_t; // Hidden state
-            let target_idx = &forward_outputs[t].target_idx;
-            let logits_t = &forward_outputs[t].logits_t;
-            let h_prev = if t == 0 {
-                h_t
-            } else {
-                &forward_outputs[t - 1].h_t
-            }; // Hidden t-1 state
-            //let a_t = &pred_a_vec[t]; // Activation state
-            let x_t = &forward_outputs[t].x_t; // Input state
-            //let target_y = &forward_outputs[t].target_y; // Real output state
+                let forward_outputs = self.forward(&input);
 
-            let sig_der = z_t.map(|z| sigmoid_der(*z)); // Sigmoid derivative element wise
-            //let delta_y = y_t - target_y; // derivative dL/da(L) or dL/dy
+                let loss = self.loss(&forward_outputs, input);
+                //println!("Loss: {}", loss);
 
-            //loss = delta_y.sum() / delta_y.len() as f32;
-            let probs = softmax(logits_t);
-            let mut delta_y = probs.clone();
-            *delta_y.get_mut(*target_idx).unwrap() -= 1.0;
+                let mut delta_h_next = Array1::zeros(self.hidden_size);
 
-            let delta_h = self.W_hy.t().dot(&delta_y) + &delta_h_next;
-            let delta_z = &delta_h * sig_der; // derivative dL/da(L) or dL/dy
+                // Backprop
+                for t in (0..forward_outputs.len()).rev() {
+                    //let y_t = &forward_outputs[t].pred_y; // Predicted Output
+                    let z_t = &forward_outputs[t].z_t; // Pre-Activation
+                    let h_t = &forward_outputs[t].h_t; // Hidden state
+                    let target_idx = &forward_outputs[t].target_idx;
+                    let logits_t = &forward_outputs[t].logits_t;
+                    let h_prev = if t == 0 {
+                        h_t
+                    } else {
+                        &forward_outputs[t - 1].h_t
+                    };
 
-            {
-                // THIS uses x_t
-                // For w_xh
-                let gradient_xh = outer_product(&delta_z, x_t);
-                total_gradient_W_xh += &gradient_xh;
-            }
+                    let x_t = &forward_outputs[t].x_t; // Input state
 
-            {
-                // THIS USES h{t-1}
-                // For w_hh
-                let gradient_hh = outer_product(&delta_z, h_prev);
-                total_gradient_W_hh += &gradient_hh;
-            }
-            {
-                // THIS USES h_t
-                // For w_hy
-                let gradient_hy = outer_product(&delta_y, h_t);
+                    let sig_der = z_t.map(|z| sigmoid_der(*z)); // Sigmoid derivative element wise
 
-                total_gradient_W_hy += &gradient_hy;
-                //let total_W_hy = &delta_y * &der_z_wrt_w * &der_a_wrt_z;
-            }
-            delta_h_next = self.W_hh.t().dot(&delta_z);
-            // Propagate error to hidden state
+                    let probs = softmax(logits_t);
+                    let mut delta_y = probs.clone();
+                    *delta_y.get_mut(*target_idx).unwrap() -= 1.0;
 
-            //let w_hy_T = self.W_hy.to_shape((self.W_hy.nrows(), 1)).unwrap();
-            //let delta_h_t = w_hy_T.dot(&delta_y_t) + delta_h_t1;
+                    let delta_h = self.W_hy.t().dot(&delta_y) + &delta_h_next;
+                    let delta_z = &delta_h * sig_der; // derivative dL/da(L) or dL/dy
 
-            //let loss = self.loss(target_y_embedding.t(), pred_y.t(), batch_size);
+                    {
+                        // THIS uses x_t
+                        // For w_xh
+                        let gradient_xh = outer_product(&delta_z, x_t);
+                        total_gradient_W_xh += &gradient_xh;
+                    }
+
+                    {
+                        // THIS USES h{t-1}
+                        // For w_hh
+                        let gradient_hh = outer_product(&delta_z, h_prev);
+                        total_gradient_W_hh += &gradient_hh;
+                    }
+                    {
+                        // THIS USES h_t
+                        // For w_hy
+
+                        let gradient_hh = outer_product(&delta_y, h_t);
+                        total_gradient_W_hy += &gradient_hh;
+                    }
+
+                    {
+                        // THIS USES
+                        // For bh
+
+                        total_gradient_bh += &delta_z;
+                    }
+
+                    {
+                        // THIS USES
+                        // For by
+
+                        total_gradient_by += &delta_y;
+                    }
+
+                    delta_h_next = self.W_hh.t().dot(&delta_z);
+                }
+
+                MiniBatch {
+                    loss,
+                    total_gradient_W_hy,
+                    total_gradient_by,
+                    total_gradient_bh,
+                    total_gradient_W_xh,
+                    total_gradient_W_hh,
+                }
+            })
+            .collect();
+        acc_loss += values.iter().map(|v| v.loss).sum::<f32>();
+
+        let scale = 1.0 / batch_size as f32;
+
+        for v in values.iter() {
+            acc_gradient_by += &v.total_gradient_by;
+            acc_gradient_bh += &v.total_gradient_bh;
+            acc_gradient_W_xh += &v.total_gradient_W_xh;
+            acc_gradient_W_hh += &v.total_gradient_W_hh;
+            acc_gradient_W_hy += &v.total_gradient_W_hy;
         }
+        //self.acc_weights(
+        //    &mut acc_gradient_W_hh,
+        //    values
+        //        .iter()
+        //        .map(|v| v.total_gradient_W_hh.view())
+        //        .collect(),
+        //);
 
-        self.W_xh -= &(lr * total_gradient_W_xh);
-        self.W_hh -= &(lr * total_gradient_W_hh);
-        self.W_hy -= &(lr * total_gradient_W_hy);
+        acc_gradient_W_hh *= scale;
+        acc_gradient_W_xh *= scale;
+        acc_gradient_W_hy *= scale;
+        acc_gradient_bh *= scale;
+        acc_gradient_by *= scale;
 
-        //self.bh -= &(lr * total_gradient_bh);
-        //self.by -= &(lr * total_gradient_by);
+        self.W_xh -= &(lr * acc_gradient_W_xh);
+        self.W_hh -= &(lr * acc_gradient_W_hh);
+        self.W_hy -= &(lr * acc_gradient_W_hy);
+
+        self.bh -= &(lr * acc_gradient_bh);
+        self.by -= &(lr * acc_gradient_by);
         //}
-        loss
+
+        acc_loss / batch_size as f32
+    }
+
+    fn acc_weights<D: Dimension>(&self, acc: &mut Array<f32, D>, weights: Vec<ArrayView<f32, D>>) {
+        for w in weights {
+            *acc += &w;
+        }
     }
 
     pub fn clear_hidden(&mut self) {
@@ -407,9 +526,11 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 fn sample(probs: Array1<f32>) -> usize {
-    probs.to_vec().sort_by(|a, b| b.total_cmp(a));
+    let dist = WeightedIndex::new(probs).unwrap();
 
-    2
+    let mut rng = rand::rng();
+
+    dist.sample(&mut rng)
 }
 
 pub fn argmax(arr: &Array1<f32>) -> usize {
