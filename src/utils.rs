@@ -1,4 +1,7 @@
-use std::{fs, io};
+use std::{
+    fs,
+    io::{self, BufReader},
+};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -20,6 +23,15 @@ pub fn corpus_folder(path: &str) -> String {
 
 pub fn corpus_file(path: &str) -> String {
     fs::read_to_string(path).unwrap()
+}
+
+pub fn corpus_json<T: DeserializeOwned>(path: &str) -> Result<T> {
+    let file = fs::File::open(path)?;
+    let rdr = BufReader::new(file);
+
+    let r: T = serde_json::from_reader(rdr)?;
+
+    Ok(r)
 }
 
 pub fn read_csv<R: DeserializeOwned>(path: &str) -> Result<Vec<R>> {
